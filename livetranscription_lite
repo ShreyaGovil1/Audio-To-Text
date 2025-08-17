@@ -1,0 +1,142 @@
+import numpy as np
+import pyaudio
+from faster_whisper import WhisperModel
+from collections import deque
+import threading
+import time
+import signal
+import sys
+from datetime import datetime
+import os
+
+# Configuration
+CHUNK_SIZE, RATE, BUFFER_SECONDS = 1024, 16000, 3
+BUFFER_SIZE = int(RATE / CHUNK_SIZE * BUFFER_SECONDS)
+
+# Global state
+audio_buffer = deque(maxlen=BUFFER_SIZE)
+is_running = True
+session_log = []
+session_start = datetime.now()
+
+# Load model
+print("Loading Whisper model...")
+model = WhisperModel("base.en", device="cpu", compute_type="float32")
+print("Model loaded. Starting transcription...")
+
+def signal_handler(sig, frame):
+    global is_running
+    print("\nShutting down...")
+    is_running = False
+
+def log_transcription(text, is_new_segment=False):
+    session_log.append({
+        'timestamp': datetime.now(),
+        'text': text,
+        'is_new_segment': is_new_segment
+    })
+
+def save_session_log():
+    try:
+        os.makedirs("transcription_logs", exist_ok=True)
+        filename = f"transcription_logs/session_{session_start.strftime('%Y%m%d_%H%M%S')}.txt"
+        
+        with open(filename, 'w', encoding='utf-8') as f:
+            f.write(f"Transcription Session Log\n")
+            f.write(f"Started: {session_start.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Ended: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write("="*60 + "\n\n")
+            
+            # Complete transcript
+            f.write("COMPLETE TRANSCRIPT:\n" + "-"*40 + "\n")
+            full_text = ""
+            for entry in session_log:
+                if entry['is_new_segment']:
+                    full_text += "\n"
+                full_text += entry['text'] + " "
+            f.write(full_text.strip() + "\n\n")
+            
+            # Detailed log with timestamps
+            f.write("DETAILED LOG WITH TIMESTAMPS:\n" + "-"*40 + "\n")
+            for entry in session_log:
+                timestamp_str = entry['timestamp'].strftime('%H:%M:%S.%f')[:-3]
+                marker = "[NEW]" if entry['is_new_segment'] else "[ADD]"
+                f.write(f"{timestamp_str} {marker} {entry['text']}\n")
+        
+        print(f"Session log saved to: {filename}")
+    except Exception as e:
+        print(f"Error saving log: {e}")
+
+def transcribe_audio():
+    last_text = ""
+    while is_running:
+        if len(audio_buffer) < 10:
+            time.sleep(0.1)
+            continue
+        
+        # Convert audio
+        audio_data = b''.join(list(audio_buffer))
+        audio_np = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
+        
+        # Skip if silent
+        if np.max(np.abs(audio_np)) < 0.01:
+            time.sleep(0.1)
+            continue
+        
+        # Transcribe
+        segments, _ = model.transcribe(audio_np, beam_size=1, without_timestamps=True, vad_filter=True)
+        current_text = " ".join(segment.text for segment in segments).strip()
+        
+        if current_text and current_text != last_text:
+            if last_text and current_text.startswith(last_text):
+                # Extension of previous text
+                new_part = current_text[len(last_text):].strip()
+                if new_part:
+                    print(new_part, end=" ", flush=True)
+                    log_transcription(new_part, False)
+            else:
+                # New segment
+                is_new = bool(last_text)
+                if is_new:
+                    print(f"\n{current_text}", end=" ", flush=True)
+                else:
+                    print(current_text, end=" ", flush=True)
+                log_transcription(current_text, is_new)
+            
+            last_text = current_text
+        
+        time.sleep(0.5)
+
+def record_audio():
+    p = pyaudio.PyAudio()
+    stream = p.open(format=pyaudio.paInt16, channels=1, rate=RATE, input=True, frames_per_buffer=CHUNK_SIZE)
+    
+    try:
+        while is_running:
+            data = stream.read(CHUNK_SIZE, exception_on_overflow=False)
+            audio_buffer.append(data)
+    finally:
+        stream.close()
+        p.terminate()
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGINT, signal_handler)
+    
+    try:
+        print(f"Session started at: {session_start.strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        # Start transcription thread
+        threading.Thread(target=transcribe_audio, daemon=True).start()
+        time.sleep(0.3)
+        
+        # Start recording
+        record_audio()
+        
+    except KeyboardInterrupt:
+        print("\nSession interrupted by user.")
+    finally:
+        is_running = False
+        if session_log:
+            save_session_log()
+        print("Session completed!")
+        sys.exit(0)
